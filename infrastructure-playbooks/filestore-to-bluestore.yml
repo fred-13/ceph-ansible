@@ -2,7 +2,10 @@
 #
 # Use it like this:
 # ansible-playbook infrastructure-playbooks/filestore-to-bluestore.yml --limit <osd-node-to-migrate>
-# *ALL* osds on nodes will be shrinked and redeployed using bluestore backend with ceph-volume
+# If all osds on the node are using filestore backend, then *ALL* of them will be shrinked and redeployed using bluestore backend with ceph-volume.
+#
+# If a mix of filestore and bluestore OSDs is detected on the node, the node will be skipped unless you pass `force_filestore_to_bluestore=True` as an extra var.
+# ie: ansible-playbook infrastructure-playbooks/filestore-to-bluestore.yml --limit <osd-node-to-migrate> -e force_filestore_to_bluestore=True
 
 - hosts: "{{ osd_group_name }}"
   become: true
@@ -12,6 +15,10 @@
   tasks:
     - name: gather and delegate facts
       setup:
+        gather_subset:
+          - 'all'
+          - '!facter'
+          - '!ohai'
       delegate_to: "{{ item }}"
       delegate_facts: True
       with_items: "{{ groups[mon_group_name] }}"
@@ -21,33 +28,61 @@
     - import_role:
         name: ceph-defaults
 
-    - name: set_fact current_objectstore
+    - name: import_role ceph-facts
+      import_role:
+        name: ceph-facts
+        tasks_from: container_binary.yml
+
+    - name: set_fact ceph_cmd
       set_fact:
-        current_objectstore: '{{ osd_objectstore }}'
+        ceph_cmd: "{{ container_binary + ' run --rm --net=host -v /etc/ceph:/etc/ceph:z -v /var/lib/ceph:/var/lib/ceph:z -v /var/run/ceph:/var/run/ceph:z --entrypoint=ceph ' + ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment | bool else 'ceph' }}"
 
-    - name: warn user about osd already using bluestore
-      debug:
-        msg: 'WARNING: {{ inventory_hostname }} is already using bluestore. Skipping all tasks.'
-      when: current_objectstore == 'bluestore'
+    - name: get ceph osd tree data
+      command: "{{ ceph_cmd }} --cluster {{ cluster }} osd tree -f json"
+      delegate_to: "{{ groups[mon_group_name][0] }}"
+      register: osd_tree
+      changed_when: false
+      run_once: true
 
-    - name: shrink and redeploy filestore osds
-      when: current_objectstore == 'filestore'
+    - name: set_fact osd_ids
+      set_fact:
+        osd_ids: "{{ osd_ids | default([]) | union(item) }}"
+      with_items:
+        - "{{ ((osd_tree.stdout | default('{}') | trim | from_json).nodes | selectattr('name', 'match', '^' + inventory_hostname + '$') | map(attribute='children') | list) }}"
+
+    - name: get osd metadata
+      command: "{{ ceph_cmd }} --cluster {{ cluster }} osd metadata osd.{{ item }} -f json"
+      register: osd_metadata
+      delegate_to: "{{ groups[mon_group_name][0] }}"
+      run_once: true
+      changed_when: false
+      with_items: "{{ osd_ids }}"
+
+    - name: set_fact _osd_objectstore
+      set_fact:
+        _osd_objectstore: "{{ _osd_objectstore | default([]) | union([(item.stdout | from_json).osd_objectstore]) }}"
+      with_items: "{{ osd_metadata.results }}"
+
+    - name: set_fact skip_this_node
+      set_fact:
+        skip_this_node: "{{ ('filestore' in _osd_objectstore and 'bluestore' in _osd_objectstore and not force_filestore_to_bluestore | default(False)) or ('filestore' not in _osd_objectstore) }}"
+
+    - name: add node to skipped node list
+      set_fact:
+        skipped_nodes: "{{ skipped_nodes | default([]) | union([inventory_hostname]) }}"
+      when:
+        - skip_this_node | bool
+
+    - name: filestore to bluestore migration workflow
+      when: not skip_this_node | bool
       block:
-        - import_role:
-            name: ceph-facts
-
-        - name: get ceph osd tree data
-          command: "{{ container_exec_cmd }} ceph osd tree -f json"
-          delegate_to: "{{ groups[mon_group_name][0] }}"
-          register: osd_tree
-          run_once: true
-
-        - name: set_fact container_run_cmd
-          set_fact:
-            container_run_cmd: "{{ container_binary + ' run --rm --privileged=true --net=host --pid=host --ipc=host -v /dev:/dev -v /etc/ceph:/etc/ceph -v /var/lib/ceph:/var/lib/ceph -v /var/run:/var/run --entrypoint=' if containerized_deployment else '' }}ceph-volume {{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment else '' }}"
-
         - name: get ceph-volume lvm inventory data
-          command: "{{ container_run_cmd }} --cluster {{ cluster }} inventory --format json"
+          ceph_volume:
+            cluster: "{{ cluster }}"
+            action: inventory
+          environment:
+            CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment | bool else None }}"
+            CEPH_CONTAINER_BINARY: "{{ container_binary }}"
           register: ceph_volume_inventory
 
         - name: set_fact inventory
@@ -71,14 +106,26 @@
               with_items: "{{ ceph_disk_osds_devices | default([]) }}"
 
             - name: get simple scan data
-              command: "{{ container_run_cmd }} --cluster {{ cluster }} simple scan {{ item.item + 'p1' if item.item is match('/dev/(cciss/c[0-9]d[0-9]|nvme[0-9]n[0-9]){1,2}$') else item.item + '1' }} --stdout"
+              ceph_volume_simple_scan:
+                path: "{{ item.item + 'p1' if item.item is match('/dev/(cciss/c[0-9]d[0-9]|nvme[0-9]n[0-9]){1,2}$') else item.item + '1' }}"
+                cluster: "{{ cluster }"
+                stdout: true
+              environment:
+                CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment | bool else None }}"
+                CEPH_CONTAINER_BINARY: "{{ container_binary }}"
               register: simple_scan
               with_items: "{{ partlabel.results | default([]) }}"
               when: item.stdout == 'ceph data'
               ignore_errors: true
 
             - name: mark out osds
-              command: "{{ container_exec_cmd }} ceph --cluster {{ cluster }} osd out {{ (item.0.stdout | from_json).whoami }}"
+              ceph_osd:
+                ids: "{{ (item.0.stdout | from_json).whoami }}"
+                cluster: "{{ cluster }}"
+                state: out
+              environment:
+                CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment | bool else None }}"
+                CEPH_CONTAINER_BINARY: "{{ container_binary }}"
               with_together:
                 - "{{ simple_scan.results }}"
                 - "{{ partlabel.results }}"
@@ -139,14 +186,28 @@
                 - (item.0.stdout | from_json).encrypted | default(False) | bool
 
             - name: zap data devices
-              command: "{{ container_run_cmd }} --cluster {{ cluster }} lvm zap --destroy {{ (item.0.stdout | from_json).data.path }}"
+              ceph_volume:
+                cluster: "{{ cluster }}"
+                action: zap
+                destroy: true
+                data: "{{ (item.0.stdout | from_json).data.path }}"
+              environment:
+                CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment | bool else None }}"
+                CEPH_CONTAINER_BINARY: "{{ container_binary }}"
               with_together:
                 - "{{ simple_scan.results }}"
                 - "{{ partlabel.results }}"
               when: item.1.stdout == 'ceph data'
 
             - name: zap journal devices
-              command: "{{ container_run_cmd }} --cluster {{ cluster }} lvm zap --destroy {{ (item.0.stdout | from_json).journal.path }}"
+              ceph_volume:
+                cluster: "{{ cluster }}"
+                action: zap
+                destroy: true
+                journal: "{{ (item.0.stdout | from_json).journal.path }}"
+              environment:
+                CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment | bool else None }}"
+                CEPH_CONTAINER_BINARY: "{{ container_binary }}"
               with_together:
                 - "{{ simple_scan.results }}"
                 - "{{ partlabel.results }}"
@@ -155,19 +216,29 @@
                 - (item.0.stdout | from_json).journal.path is defined
 
         - name: get ceph-volume lvm list data
-          command: "{{ container_run_cmd }} --cluster {{ cluster }} lvm list --format json"
+          ceph_volume:
+            cluster: "{{ cluster }}"
+            action: list
+          environment:
+            CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment | bool else None }}"
+            CEPH_CONTAINER_BINARY: "{{ container_binary }}"
           register: ceph_volume_lvm_list
 
         - name: set_fact _lvm_list
           set_fact:
             _lvm_list: "{{ _lvm_list | default([]) + item.value }}"
-          with_dict: "{{ (ceph_volume_lvm_list.stdout | from_json) }}"
+          with_dict: "{{ (ceph_volume_lvm_list.stdout | default('{}') | from_json) }}"
 
         - name: ceph-volume prepared OSDs related tasks
           block:
             - name: mark out osds
-              command: "{{ container_exec_cmd }} ceph --cluster {{ cluster }} osd out {{ item }}"
-              with_items: "{{ (ceph_volume_lvm_list.stdout | from_json).keys() | list }}"
+              ceph_osd:
+                ids: "{{ (ceph_volume_lvm_list.stdout | default('{}') | from_json).keys() | list }}"
+                cluster: "{{ cluster }}"
+                state: out
+              environment:
+                CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment | bool else None }}"
+                CEPH_CONTAINER_BINARY: "{{ container_binary }}"
               delegate_to: "{{ groups[mon_group_name][0] }}"
               run_once: true
 
@@ -176,7 +247,7 @@
                 name: "ceph-osd@{{ item }}"
                 state: stopped
                 enabled: no
-              with_items: "{{ (ceph_volume_lvm_list.stdout | from_json).keys() | list }}"
+              with_items: "{{ (ceph_volume_lvm_list.stdout | default('{}') | from_json).keys() | list }}"
 
             - name: stop and disable ceph-volume services
               service:
@@ -189,8 +260,13 @@
                 - item.type == 'data'
 
             - name: mark down osds
-              command: "{{ container_exec_cmd }} ceph --cluster {{ cluster }} osd down {{ item }}"
-              with_items: "{{ (ceph_volume_lvm_list.stdout | from_json).keys() | list }}"
+              ceph_osd:
+                ids: "{{ (ceph_volume_lvm_list.stdout | default('{}') | from_json).keys() | list }}"
+                cluster: "{{ cluster }}"
+                state: down
+              environment:
+                CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment | bool else None }}"
+                CEPH_CONTAINER_BINARY: "{{ container_binary }}"
               delegate_to: "{{ groups[mon_group_name][0] }}"
               run_once: true
 
@@ -203,7 +279,7 @@
 
             - name: set_fact osd_fsid_list
               set_fact:
-                osd_fsid_list: "{{ osd_fsid_list | default([]) + [{'osd_fsid': item.tags['ceph.osd_fsid'], 'destroy': (item.lv_name.startswith('osd-data-') and item.vg_name.startswith('ceph-')) | ternary(true, false), 'device': item.devices[0]}] }}"
+                osd_fsid_list: "{{ osd_fsid_list | default([]) + [{'osd_fsid': item.tags['ceph.osd_fsid'], 'destroy': (item.lv_name.startswith('osd-data-') and item.vg_name.startswith('ceph-')) | ternary(true, false), 'device': item.devices[0], 'journal': item['tags']['ceph.journal_device'] }] }}"
               with_items: "{{ _lvm_list }}"
               when: item.type == 'data'
 
@@ -213,8 +289,8 @@
                 osd_fsid: "{{ item.osd_fsid }}"
                 destroy: false
               environment:
-                CEPH_VOLUME_DEBUG: 1
-                CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment else None }}"
+                CEPH_VOLUME_DEBUG: "{{ ceph_volume_debug }}"
+                CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment | bool else None }}"
                 CEPH_CONTAINER_BINARY: "{{ container_binary }}"
               loop: "{{ osd_fsid_list }}"
               when: osd_fsid_list is defined
@@ -225,13 +301,41 @@
                 data: "{{ item.device }}"
                 destroy: true
               environment:
-                CEPH_VOLUME_DEBUG: 1
-                CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment else None }}"
+                CEPH_VOLUME_DEBUG: "{{ ceph_volume_debug }}"
+                CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment | bool else None }}"
                 CEPH_CONTAINER_BINARY: "{{ container_binary }}"
               loop: "{{ osd_fsid_list }}"
               when:
                 - osd_fsid_list is defined
                 - item.destroy | bool
+
+            - name: test if the journal device hasn't been already destroyed because of collocation
+              stat:
+                path: "{{ item.journal }}"
+              loop: "{{ osd_fsid_list }}"
+              register: journal_path
+              when:
+                - osd_fsid_list is defined
+                - item.destroy | bool
+                - item.journal is defined
+                - item.journal not in (lvm_volumes | selectattr('journal', 'defined') | map(attribute='journal') | list)
+
+            - name: zap destroy ceph-volume prepared journal devices
+              ceph_volume:
+                action: "zap"
+                data: "{{ item.0.journal }}"
+                destroy: true
+              environment:
+                CEPH_VOLUME_DEBUG: "{{ ceph_volume_debug }}"
+                CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment else None }}"
+                CEPH_CONTAINER_BINARY: "{{ container_binary }}"
+              loop: "{{ osd_fsid_list | zip(journal_path.results) | list }}"
+              when:
+                - osd_fsid_list is defined
+                - item.0.destroy | bool
+                - item.0.journal is defined
+                - item.0.journal not in (lvm_volumes | selectattr('journal', 'defined') | map(attribute='journal') | list)
+                - item.1.stat.exists | bool
 
             - name: ensure all dm are closed
               command: dmsetup remove "{{ item['lv_path'] }}"
@@ -257,12 +361,16 @@
           set_fact:
             osd_ids: "{{ osd_ids | default([]) + [item] }}"
           with_items:
-            - "{{ ((osd_tree.stdout | from_json).nodes | selectattr('name', 'match', inventory_hostname) | map(attribute='children') | list) }}"
-
+            - "{{ ((osd_tree.stdout | default('{}') | from_json).nodes | selectattr('name', 'match', inventory_hostname) | map(attribute='children') | list) }}"
 
         - name: purge osd(s) from the cluster
-          command: >
-            {{ container_exec_cmd }} ceph --cluster {{ cluster }} osd purge {{ item }} --yes-i-really-mean-it
+          ceph_osd:
+            ids: "{{ item }}"
+            cluster: "{{ cluster }}"
+            state: purge
+          environment:
+            CEPH_CONTAINER_IMAGE: "{{ ceph_docker_registry + '/' + ceph_docker_image + ':' + ceph_docker_image_tag if containerized_deployment | bool else None }}"
+            CEPH_CONTAINER_BINARY: "{{ container_binary }}"
           run_once: true
           delegate_to: "{{ groups[mon_group_name][0] }}"
           with_items: "{{ osd_ids }}"
@@ -273,17 +381,32 @@
             state: absent
           with_items: "{{ osd_ids }}"
 
-        - name: remove gpt header
-          command: parted -s "{{ item }}" mklabel msdos
-          with_items: "{{ (devices + dedicated_devices + ceph_disk_osds_devices | default([])) | unique }}"
+        - name: force osd_objectstore to bluestore
+          set_fact:
+            osd_objectstore: bluestore
 
         - name: refresh ansible devices fact
           setup:
+            gather_subset:
+              - 'all'
+              - '!facter'
+              - '!ohai'
             filter: ansible_devices
           when: osd_auto_discovery | bool
 
+        - import_role:
+            name: ceph-defaults
+        - import_role:
+            name: ceph-facts
+
+        - name: remove gpt header
+          command: parted -s "{{ item }}" mklabel msdos
+          with_items: "{{ (devices + dedicated_devices | default([]) + ceph_disk_osds_devices | default([])) | unique }}"
+
         - name: update lvm_volumes configuration for bluestore
-          when: lvm_volumes is defined
+          when:
+            - lvm_volumes | length > 0
+            - not osd_auto_discovery | bool
           block:
             - name: reuse filestore journal partition for bluestore db
               set_fact:
@@ -299,14 +422,6 @@
               set_fact:
                 lvm_volumes: "{{ config_part | default([]) + config_vglv | default([]) }}"
 
-        - name: force osd_objectstore to bluestore
-          set_fact:
-            osd_objectstore: bluestore
-
-        - import_role:
-            name: ceph-defaults
-        - import_role:
-            name: ceph-facts
         - import_role:
             name: ceph-handler
         - import_role:
@@ -316,3 +431,15 @@
             name: ceph-config
         - import_role:
             name: ceph-osd
+
+    - name: report any skipped node during this playbook
+      debug:
+        msg: |
+          "WARNING:"
+          "The following nodes were skipped because OSDs are either"
+          "all bluestore ones or there's a mix of filestore and bluestore OSDs"
+
+          "{{ ' '.join(skipped_nodes) }}"
+      when:
+        - inventory_hostname == ansible_play_hosts_all | last
+        - skipped_nodes is defined

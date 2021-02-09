@@ -11,6 +11,7 @@ mds0
 rgw0
 
 [rgws]
+osd0
 rgw0
 mds0
 
@@ -22,5 +23,5 @@ mds0
 #rgw0
 #mds0
 
-[grafana-server]
+[monitoring]
 mon0

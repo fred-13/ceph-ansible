@@ -60,7 +60,7 @@ ansible_provision = proc do |ansible|
     'clients'          => (0..CLIENTS - 1).map { |j| "#{LABEL_PREFIX}client#{j}" },
     'iscsigws'         => (0..NISCSI_GWS - 1).map { |j| "#{LABEL_PREFIX}iscsi_gw#{j}" },
     'mgrs'             => (0..MGRS - 1).map { |j| "#{LABEL_PREFIX}mgr#{j}" },
-    'grafana-server'   => (0..GRAFANA - 1).map { |j| "#{LABEL_PREFIX}grafana#{j}" }
+    'monitoring'   => (0..GRAFANA - 1).map { |j| "#{LABEL_PREFIX}grafana#{j}" }
   }
 
   ansible.extra_vars = {
@@ -76,7 +76,6 @@ ansible_provision = proc do |ansible|
       monitor_interface: ETH,
       ceph_mon_docker_subnet: "#{PUBLIC_SUBNET}.0/24",
       devices: settings['disks'],
-      ceph_docker_on_openstack: BOX == 'openstack',
       radosgw_interface: ETH,
       generate_fsid: 'true',
     })
